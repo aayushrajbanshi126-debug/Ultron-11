@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ultron</string>
+    <string name="accessibility_service_description">Lets Ultron read screen content and perform taps in other apps on your command. You control when this is active in Settings.</string>
+</resources>
