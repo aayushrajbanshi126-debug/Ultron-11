@@ -4,34 +4,30 @@ import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
+import org.vosk.Model
+import org.vosk.Recognizer
+import org.vosk.android.RecognitionListener
+import org.vosk.android.SpeechService
+import org.vosk.android.StorageService
 import java.util.Locale
 
 /**
- * PHASE 1 — core loop only.
+ * PHASE 1.1 — switched from android.speech.SpeechRecognizer to Vosk
+ * (fully offline, bundled in the app). This is the real fix for the
+ * beep/tone problem: there is no OS speech-recognition SERVICE being
+ * invoked at all anymore, so there's nothing to make a sound. Everything
+ * runs as local audio processing inside the app.
  *
- * Uses SpeechRecognizer directly (not the RecognizerIntent popup that
- * termux-speech-to-text relies on), so there's no system UI flash and no
- * forced earcon tied to your ringer volume — that whole class of problem
- * goes away by building a real app.
- *
- * Wake phrases / sleep phrases / auto-timeout mirror the Termux version so
- * behavior is familiar. Command handling (open app, call contact, etc.) gets
- * wired in during Phase 2 — this file currently just proves the listening
- * loop, wake/sleep state, and TTS work end-to-end.
+ * The model is bundled as app/src/main/assets/model-en-us.zip and gets
+ * unpacked to internal storage automatically on first run.
  */
 class UltronForegroundService : Service(), TextToSpeech.OnInitListener {
 
-    private lateinit var speechRecognizer: SpeechRecognizer
     private lateinit var tts: TextToSpeech
-    private val handler = Handler(Looper.getMainLooper())
+    private var speechService: SpeechService? = null
 
     private var mode = "sleeping"          // "sleeping" | "active"
     private var activeSince: Long = 0L
@@ -43,15 +39,12 @@ class UltronForegroundService : Service(), TextToSpeech.OnInitListener {
     override fun onCreate() {
         super.onCreate()
         tts = TextToSpeech(this, this)
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         startForegroundNotification()
-        startListening()
+        loadModelAndStart()
     }
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts.language = Locale.US
-        }
+        if (status == TextToSpeech.SUCCESS) tts.language = Locale.US
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -76,61 +69,71 @@ class UltronForegroundService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun startListening() {
-        val recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-        }
-
-        speechRecognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(results: Bundle?) {
-                val text = results
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                    ?.lowercase(Locale.US) ?: ""
-                handleHeard(text)
-                relisten()
+    private fun loadModelAndStart() {
+        StorageService.unpack(
+            this, "model-en-us", "model",
+            { model -> initRecognizer(model) },
+            { exception ->
+                // If this fires, the model asset likely didn't get bundled
+                // correctly during the build — check the build.yml step
+                // that downloads/places model-en-us.zip in assets.
+                speak("Model failed to load.")
             }
-
-            override fun onError(error: Int) {
-                // No speech / timeout / etc. — just try again. No tone plays here
-                // because we never launched the popup UI in the first place.
-                relisten()
-            }
-
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-            override fun onPartialResults(partialResults: Bundle?) {}
-        })
-
-        speechRecognizer.startListening(recognizerIntent)
+        )
     }
 
-    private fun relisten() {
-        val delay = if (mode == "active") 300L else 800L
-        handler.postDelayed({ startListening() }, delay)
-        checkAutoSleep()
+    private fun initRecognizer(model: Model) {
+        try {
+            val rec = Recognizer(model, 16000.0f)
+            speechService = SpeechService(rec, 16000.0f)
+            speechService?.startListening(object : RecognitionListener {
+                override fun onPartialResult(hypothesis: String?) {}
+
+                override fun onResult(hypothesis: String?) {
+                    val text = extractText(hypothesis)
+                    if (text.isNotBlank()) handleHeard(text)
+                }
+
+                override fun onFinalResult(hypothesis: String?) {
+                    val text = extractText(hypothesis)
+                    if (text.isNotBlank()) handleHeard(text)
+                }
+
+                override fun onError(exception: Exception?) {
+                    // Silent — just keep listening, no tone, no popup.
+                }
+
+                override fun onTimeout() {}
+            })
+        } catch (e: Exception) {
+            speak("Recognizer failed to start.")
+        }
+    }
+
+    private fun extractText(hypothesis: String?): String {
+        if (hypothesis.isNullOrBlank()) return ""
+        return try {
+            JSONObject(hypothesis).optString("text", "").lowercase(Locale.US)
+        } catch (e: Exception) {
+            ""
+        }
     }
 
     private fun checkAutoSleep() {
         if (mode == "active" && System.currentTimeMillis() - activeSince > activeTimeoutMs) {
             mode = "sleeping"
-            updateNotification()
+            startForegroundNotification()
         }
     }
 
     private fun handleHeard(text: String) {
-        if (text.isBlank()) return
+        checkAutoSleep()
 
         if (mode == "sleeping") {
             if (wakePhrases.any { text.contains(it) }) {
                 mode = "active"
                 activeSince = System.currentTimeMillis()
-                updateNotification()
+                startForegroundNotification()
                 // Phase 1: just confirm. Phase 2 wires in real commands here.
                 speak("Yes?")
             }
@@ -138,7 +141,7 @@ class UltronForegroundService : Service(), TextToSpeech.OnInitListener {
             activeSince = System.currentTimeMillis()
             if (sleepPhrases.any { text.contains(it) }) {
                 mode = "sleeping"
-                updateNotification()
+                startForegroundNotification()
                 speak("Going to sleep.")
             } else {
                 // Phase 2: route `text` to command handling / Accessibility actions here.
@@ -151,12 +154,9 @@ class UltronForegroundService : Service(), TextToSpeech.OnInitListener {
         tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ultron_utterance")
     }
 
-    private fun updateNotification() {
-        startForegroundNotification()
-    }
-
     override fun onDestroy() {
-        speechRecognizer.destroy()
+        speechService?.stop()
+        speechService?.shutdown()
         tts.shutdown()
         super.onDestroy()
     }
